@@ -449,6 +449,11 @@ specification. Since value names can only be strings, the *S* (string) marker
 
 The child elements of an object are ordered and can be accessed by their names.
 
+A key length **must** use the smallest unsigned integer type that can represent
+it: `U` for 0-255, `u` for up to 65,535, `m` for up to 4,294,967,295, otherwise
+`M`. Every key therefore has exactly one encoded form, allowing a parser to
+pre-encode the keys it looks for and match them by comparing raw bytes.
+
 #### Example
 
 Object in JSON:
@@ -680,7 +685,7 @@ The schema is a **payload-less object**: keys followed by type markers only, no 
 ```
 schema        = '{' 1*(field-def) '}'
 field-def     = name type-spec
-name          = uint-type length string-bytes
+name          = uint-type length string-bytes  // smallest type that fits
 uint-type     = 'U' | 'u' | 'm' | 'M'
 type-spec     = fixed-type | bool-type | null-type | string-spec | highprec-spec
               | nested-schema | array-spec
