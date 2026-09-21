@@ -838,7 +838,8 @@ declared separately.
 **Storage structure:**
 
 After all record payloads, each offset-table-based field appends its offset table followed
-by its value buffer, in schema field order:
+by its value buffer, in schema field order. The value buffer is written as an optimized
+byte array, so it carries its own byte length:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -852,7 +853,7 @@ by its value buffer, in schema field order:
 │ Offset Table: <count> offsets of <offset-type>                  │
 │   [start0, start1, ..., start_{count-1}]                        │
 ├─────────────────────────────────────────────────────────────────┤
-│ Value Buffer: concatenated values (no length prefixes)          │
+│ Value Buffer: [[][$][B][#]<len-type><len> then <len> bytes      │
 │   val0 ∥ val1 ∥ val2 ∥ ...                                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -868,11 +869,15 @@ value        = value_buffer[offset_start:offset_end]
 An index of `<count> - 1` or greater selects no value and MUST be rejected, as it has no
 closing offset.
 
-The offset table MUST be monotonically non-decreasing. Its final entry gives the total
-byte length of the value buffer.
+The offset table MUST be monotonically non-decreasing, and every offset MUST be less than
+or equal to the declared buffer length. The final offset need not equal the buffer length:
+any bytes beyond it are unused, which permits a buffer to be allocated larger than it is
+currently filled.
 
-**Shared values:** several records may store the same index, in which case they share one
-span and the value is stored once.
+**Shared and unreferenced values:** several records may store the same index, in which
+case they share one span and the value is stored once. Conversely, a span that no record
+references is ignored by a decoder; such spans are permitted so that a table and buffer
+may be allocated ahead of use.
 
 **Empty values:** represented by two consecutive identical offsets.
 
@@ -881,7 +886,8 @@ span and the value is stored once.
 - No wasted padding bytes
 - Random access via offset table, without scanning the values
 - Repeated values are stored once
-- The table states its own size, so it no longer has to match the record count
+- Both the table and the buffer state their own size, so a field can be skipped, or
+  validated, without reading its values
 
 ---
 
@@ -1159,12 +1165,12 @@ offset type is set by the size of the value buffer and does not affect the recor
 │ Name Offset Table (4 × uint32):                              │
 │   [0, 5, 8, 32]                                              │  16 bytes
 ├──────────────────────────────────────────────────────────────┤
-│ Name String Buffer:                                          │
-│   "AliceBobDr. Christopher Williams"                         │  32 bytes
+│ Name Value Buffer: [[][$][B][#][U][32] then                  │
+│   "AliceBobDr. Christopher Williams"                         │  38 bytes
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Total: header + 30 (records) + 16 (offset table) + 32 (strings) = header + 78 bytes
+Total: header + 30 (records) + 16 (offset table) + 38 (buffer) = header + 84 bytes
 
 ---
 
