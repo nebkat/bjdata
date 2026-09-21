@@ -698,7 +698,8 @@ dict-string   = '[' '$' 'S' '#' count 1*(string-value)   // dictionary-based str
 highprec-spec = fixed-highprec | dict-highprec // see also offset-spec with elem-type 'H'
 fixed-highprec= 'H' uint-type length       // fixed-size high-precision number
 dict-highprec = '[' '$' 'H' '#' count 1*(highprec-value) // dictionary-based high-precision
-offset-spec   = '[' '$' uint-type elem-type ']' // offset-table-based variable-length
+offset-spec   = '[' '$' uint-type '#' uint-type count elem-type ']'
+              // offset-table-based variable-length; count is the number of offsets
 elem-type     = 'S' | 'H'                  // string or high-precision number
 nested-schema = '{' 1*(field-def) '}'
 array-spec    = '[' 1*(type-spec) ']'      // fixed array with explicit element types
@@ -711,7 +712,7 @@ array-spec    = '[' 1*(type-spec) ']'      // fixed array with explicit element 
 4. Strings (`S`) and high-precision numbers (`H`) support three storage modes:
    - **Fixed-length:** `S <uint-type> <length>` or `H <uint-type> <length>`
    - **Dictionary-based:** `[$S#<count><str1><str2>...` or `[$H#<count><val1><val2>...`
-   - **Offset-table-based:** `[$<uint-type>S]` or `[$<uint-type>H]`
+   - **Offset-table-based:** `[$<uint-type>#<count>S]` or `[$<uint-type>#<count>H]`
 5. Nested objects `{...}` are allowed if all fields use supported types
 6. No optimized containers can be used inside the schema, except in the case of serving as
    dictionary/offset-table markers for variable-length strings, as described in #4 above
@@ -777,24 +778,27 @@ represent the dictionary size:
 
 ---
 
-#### Mode 3: Offset-table-based storage (`[$<offset-type><elem-type>]`)
+#### Mode 3: Offset-table-based storage (`[$<offset-type>#<count><elem-type>]`)
 
-An offset-table based storage is used for storing string vectors of variable lengths.
-It first concatenates all strings into a single linear buffer, and assigns an integer as
-the offset from the beginning of the buffer for each string element. The use of 
-offset-table should be indicated by an payload-less optimized array containing only the
-offset type and the element type, `[$<offset-type><elem-type>]`.
+An offset-table based storage is used for storing vectors of variable-length values. It
+concatenates the stored values into a single linear buffer, and records the byte offset
+of each value from the beginning of that buffer in a separate offset table. Each record
+holds an index selecting one of those values, so two records that carry the same value
+may share a single entry.
 
+The use of an offset-table should be indicated by a payload-less optimized array giving
+the offset type, the number of offsets, and the element type.
 
-**Use case:** Diverse strings with highly variable lengths (names, descriptions, free text).
+**Use case:** Diverse values with highly variable lengths (names, descriptions, free text).
 
 **Schema syntax:**
 ```
-[$<offset-type><elem-type>]
+[$<offset-type>#<count-type><count><elem-type>]
 ```
 
 Where `<offset-type>` is an unsigned integer type (`U`, `u`, `m`, `M`) specifying the type
-of the byte-offsets held in the offset table, and `<elem-type>` declares how the bytes in
+of the byte-offsets held in the offset table, `<count>` is the number of offsets in that
+table, written as an unsigned integer value, and `<elem-type>` declares how the bytes in
 each span are to be interpreted:
 
 | `<elem-type>` | Each span holds |
@@ -806,53 +810,78 @@ The `<elem-type>` marker is required: without it, `[$m]` cannot be distinguished
 a string field and a high-precision field, since neither carries a length prefix in the
 buffer and both are delimited solely by the offset table.
 
+A table of `<count>` offsets delimits `<count> - 1` values. The count is independent of
+the record count: it equals the number of distinct values stored, which may be fewer than
+the number of records.
+
+**Index type:** each record stores an index into the table, using the smallest unsigned
+integer type that can represent `<count>`, by the same rule dictionary-based storage uses:
+
+- `count` &le; 255: `U` (uint8, 1 byte)
+- `count` &le; 65535: `u` (uint16, 2 bytes)
+- `count` &le; 4294967295: `m` (uint32, 4 bytes)
+- otherwise: `M` (uint64, 8 bytes)
+
+The index type is therefore governed by how many values are stored, while the offset type
+is governed by how large the value buffer is. These are unrelated quantities and are
+declared separately.
+
 **Example schema:**
 ```
 {
   U2 id m                    // uint32 (4 bytes in payload)
-  U4 name [$mS]              // variable string with uint32 offsets
+  U4 name [$m#U3S]           // 3 uint32 offsets, 2 distinct strings, uint8 index
   U5 value D                 // float64 (8 bytes in payload)
 }
 ```
 
 **Storage structure:**
 
-The offset-table-based string field stores an offset index in the fixed payload area.
-After all record payloads, an offset table and concatenated string buffer are appended:
+After all record payloads, each offset-table-based field appends its offset table followed
+by its value buffer, in schema field order:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │ Schema Header                                                   │
 ├─────────────────────────────────────────────────────────────────┤
-│ Fixed-size payload (N records)                                  │
-│   - Each string field position stores a sequential index (0..N-1)│
+│ Fixed-size payload (one record after another)                   │
+│   - Each offset-table field position stores an index into its   │
+│     table, in the index type derived from <count>               │
 │   - Other fields store actual values                            │
 ├─────────────────────────────────────────────────────────────────┤
-│ Offset Table: (N+1) offsets of <offset-type>                    │
-│   [0, end1, end2, ..., end_N]                                    │
+│ Offset Table: <count> offsets of <offset-type>                  │
+│   [start0, start1, ..., start_{count-1}]                        │
 ├─────────────────────────────────────────────────────────────────┤
-│ String Buffer: concatenated strings (no length prefixes)        │
-│   str1 ∥ str2 ∥ str3 ∥ ... ∥ str_N                               │
+│ Value Buffer: concatenated values (no length prefixes)          │
+│   val0 ∥ val1 ∥ val2 ∥ ...                                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Decoding string i:**
+**Decoding the value of record `r`:**
 ```
+i            = index stored at record r
 offset_start = offset_table[i]
-offset_end = offset_table[i+1]
-string_i = string_buffer[offset_start:offset_end]
+offset_end   = offset_table[i+1]
+value        = value_buffer[offset_start:offset_end]
 ```
 
-**Multiple variable-length fields:** When a schema contains multiple offset-table-based 
-fields, their offset tables and string buffers are appended in schema field order.
+An index of `<count> - 1` or greater selects no value and MUST be rejected, as it has no
+closing offset.
 
-**Empty strings:** Represented by consecutive identical offsets in the offset table.
+The offset table MUST be monotonically non-decreasing. Its final entry gives the total
+byte length of the value buffer.
+
+**Shared values:** several records may store the same index, in which case they share one
+span and the value is stored once.
+
+**Empty values:** represented by two consecutive identical offsets.
 
 **Benefits:**
-- Efficient for highly variable string lengths
+- Efficient for highly variable value lengths
 - No wasted padding bytes
-- Random access via offset table
-- String buffer can be memory-mapped
+- Random access via offset table, without scanning the values
+- Repeated values are stored once
+- The table states its own size, so it no longer has to match the record count
 
 ---
 
@@ -1108,21 +1137,24 @@ Total: 42 (header) + 90 (payload) = 132 bytes
     [U][6][active]                     // index 0
     [U][8][inactive]                   // index 1
     [U][7][pending]                    // index 2
-  [U][4][name][$][m][S][]]             // offset-based variable string (uint32 offsets)
+  [U][4][name][$][m][#][U][4][S][]]    // 4 uint32 offsets -> 3 strings, uint8 index
   [U][4][code][S][U][4]                // fixed 4-byte string
 [}]
 ```
 
-**Record payload size:** 4 (id) + 1 (status index) + 4 (name offset index) + 4 (code) = 13 bytes
+**Record payload size:** 4 (id) + 1 (status index) + 1 (name index) + 4 (code) = 10 bytes
+
+The `name` index is one byte because the offset table holds 4 entries; the `uint32`
+offset type is set by the size of the value buffer and does not affect the record stride.
 
 **Memory layout (row-major):**
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ HEADER (schema + count = 3)                                  │
 ├──────────────────────────────────────────────────────────────┤
-│ Record 1: [id=1] [status_idx=0] [name_idx=0] [code="U001"]   │  13 bytes
-│ Record 2: [id=2] [status_idx=2] [name_idx=1] [code="U002"]   │  13 bytes
-│ Record 3: [id=3] [status_idx=0] [name_idx=2] [code="U003"]   │  13 bytes
+│ Record 1: [id=1] [status_idx=0] [name_idx=0] [code="U001"]   │  10 bytes
+│ Record 2: [id=2] [status_idx=2] [name_idx=1] [code="U002"]   │  10 bytes
+│ Record 3: [id=3] [status_idx=0] [name_idx=2] [code="U003"]   │  10 bytes
 ├──────────────────────────────────────────────────────────────┤
 │ Name Offset Table (4 × uint32):                              │
 │   [0, 5, 8, 32]                                              │  16 bytes
@@ -1132,7 +1164,7 @@ Total: 42 (header) + 90 (payload) = 132 bytes
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Total: header + 39 (records) + 16 (offset table) + 32 (strings) = header + 87 bytes
+Total: header + 30 (records) + 16 (offset table) + 32 (strings) = header + 78 bytes
 
 ---
 
@@ -1159,8 +1191,8 @@ Total: header + 39 (records) + 16 (offset table) + 32 (strings) = header + 87 by
 | `H <uint> <len>` | fixed high-precision | `len` bytes | No length prefix in payload |
 | `[$S#<n>...` | dictionary string | 1-8 bytes | Index into embedded dictionary |
 | `[$H#<n>...` | dictionary high-precision | 1-8 bytes | Index into embedded dictionary |
-| `[$<type>S]` | offset-based string | sizeof(type) | Offset table + buffer appended |
-| `[$<type>H]` | offset-based high-precision | sizeof(type) | Offset table + buffer appended |
+| `[$<type>#<n>S]` | offset-based string | index type from `n` | Offset table + buffer appended |
+| `[$<type>#<n>H]` | offset-based high-precision | index type from `n` | Offset table + buffer appended |
 | `{...}` | nested object | sum of fields | All fields must be supported types |
 | `[...]` | fixed array | sum of elements | Explicit element types listed |
 
