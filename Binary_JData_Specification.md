@@ -688,18 +688,18 @@ field-def     = name type-spec
 name          = uint-type length string-bytes  // smallest type that fits
 uint-type     = 'U' | 'u' | 'm' | 'M'
 type-spec     = fixed-type | bool-type | null-type | string-spec | highprec-spec
-              | nested-schema | array-spec
+              | offset-spec | nested-schema | array-spec
 fixed-type    = 'U' | 'i' | 'u' | 'I' | 'l' | 'm' | 'L' | 'M' | 'h' | 'd' | 'D' | 'C' | 'B'
 bool-type     = 'T'                        // boolean (1 byte: T or F in payload)
 null-type     = 'Z'                        // null (0 bytes in payload)
-string-spec   = fixed-string | dict-string | offset-string
+string-spec   = fixed-string | dict-string // see also offset-spec with elem-type 'S'
 fixed-string  = 'S' uint-type length       // fixed-size string
 dict-string   = '[' '$' 'S' '#' count 1*(string-value)   // dictionary-based string
-offset-string = '[' '$' uint-type ']'      // offset-table-based variable string
-highprec-spec = fixed-highprec | dict-highprec | offset-highprec
+highprec-spec = fixed-highprec | dict-highprec // see also offset-spec with elem-type 'H'
 fixed-highprec= 'H' uint-type length       // fixed-size high-precision number
 dict-highprec = '[' '$' 'H' '#' count 1*(highprec-value) // dictionary-based high-precision
-offset-highprec = '[' '$' uint-type ']'    // offset-table-based variable high-precision (same as string)
+offset-spec   = '[' '$' uint-type elem-type ']' // offset-table-based variable-length
+elem-type     = 'S' | 'H'                  // string or high-precision number
 nested-schema = '{' 1*(field-def) '}'
 array-spec    = '[' 1*(type-spec) ']'      // fixed array with explicit element types
 ```
@@ -711,7 +711,7 @@ array-spec    = '[' 1*(type-spec) ']'      // fixed array with explicit element 
 4. Strings (`S`) and high-precision numbers (`H`) support three storage modes:
    - **Fixed-length:** `S <uint-type> <length>` or `H <uint-type> <length>`
    - **Dictionary-based:** `[$S#<count><str1><str2>...` or `[$H#<count><val1><val2>...`
-   - **Offset-table-based:** `[$<uint-type>]`
+   - **Offset-table-based:** `[$<uint-type>S]` or `[$<uint-type>H]`
 5. Nested objects `{...}` are allowed if all fields use supported types
 6. No optimized containers can be used inside the schema, except in the case of serving as
    dictionary/offset-table markers for variable-length strings, as described in #4 above
@@ -777,30 +777,40 @@ represent the dictionary size:
 
 ---
 
-#### Mode 3: Offset-table-based storage (`[$<type>]`)
+#### Mode 3: Offset-table-based storage (`[$<offset-type><elem-type>]`)
 
 An offset-table based storage is used for storing string vectors of variable lengths.
 It first concatenates all strings into a single linear buffer, and assigns an integer as
 the offset from the beginning of the buffer for each string element. The use of 
 offset-table should be indicated by an payload-less optimized array containing only the
-optimized type `[$<type>]`.
+offset type and the element type, `[$<offset-type><elem-type>]`.
 
 
 **Use case:** Diverse strings with highly variable lengths (names, descriptions, free text).
 
 **Schema syntax:**
 ```
-[$<offset-type>]
+[$<offset-type><elem-type>]
 ```
 
-Where `<offset-type>` is an unsigned integer type (`U`, `u`, `m`, `M`) 
-specifying the byte-offset type stored in the payload.
+Where `<offset-type>` is an unsigned integer type (`U`, `u`, `m`, `M`) specifying the type
+of the byte-offsets held in the offset table, and `<elem-type>` declares how the bytes in
+each span are to be interpreted:
+
+| `<elem-type>` | Each span holds |
+|---------------|-----------------|
+| `S` | raw string bytes, with no length prefix |
+| `H` | raw high-precision number bytes, with no length prefix |
+
+The `<elem-type>` marker is required: without it, `[$m]` cannot be distinguished between
+a string field and a high-precision field, since neither carries a length prefix in the
+buffer and both are delimited solely by the offset table.
 
 **Example schema:**
 ```
 {
   U2 id m                    // uint32 (4 bytes in payload)
-  U4 name [$m]               // variable string with uint32 offsets
+  U4 name [$mS]              // variable string with uint32 offsets
   U5 value D                 // float64 (8 bytes in payload)
 }
 ```
@@ -1098,7 +1108,7 @@ Total: 42 (header) + 90 (payload) = 132 bytes
     [U][6][active]                     // index 0
     [U][8][inactive]                   // index 1
     [U][7][pending]                    // index 2
-  [U][4][name][$][m][]]                // offset-based variable string (uint32 offsets)
+  [U][4][name][$][m][S][]]             // offset-based variable string (uint32 offsets)
   [U][4][code][S][U][4]                // fixed 4-byte string
 [}]
 ```
@@ -1149,7 +1159,8 @@ Total: header + 39 (records) + 16 (offset table) + 32 (strings) = header + 87 by
 | `H <uint> <len>` | fixed high-precision | `len` bytes | No length prefix in payload |
 | `[$S#<n>...` | dictionary string | 1-8 bytes | Index into embedded dictionary |
 | `[$H#<n>...` | dictionary high-precision | 1-8 bytes | Index into embedded dictionary |
-| `[$<type>]` | offset-based string/H | sizeof(type) | Offset table + buffer appended |
+| `[$<type>S]` | offset-based string | sizeof(type) | Offset table + buffer appended |
+| `[$<type>H]` | offset-based high-precision | sizeof(type) | Offset table + buffer appended |
 | `{...}` | nested object | sum of fields | All fields must be supported types |
 | `[...]` | fixed array | sum of elements | Explicit element types listed |
 

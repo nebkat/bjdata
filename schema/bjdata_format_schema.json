@@ -431,7 +431,7 @@
     },
     "BJDataSoASchema": {
       "type": "array",
-      "description": "SoA payload-less schema object: [{][field_name type_marker ...][}] - field names followed by type markers only, no data values. Permitted type markers: U i u I l m L M h d D C B T Z S H and nested {}/[] for nested objects and fixed arrays.",
+      "description": "SoA payload-less schema object: [{][field_name type_marker ...][}] - field names followed by type markers only, no data values. Permitted type markers: U i u I l m L M h d D C B T Z S H, offset-table-based variable-length fields [$<offset-type><elem-type>] where elem-type is S or H, and nested {}/[] for nested objects and fixed arrays.",
       "items": [
         {
           "type": "string",
